@@ -1,0 +1,109 @@
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
+from typing import List, Optional
+import hashlib
+import time
+import logging
+
+API_TOKENS = {
+    "user_token_123": "User123",
+    "admin_token_abc": "AdminUser"
+}
+
+def get_current_user(token: str = None):
+    if token in API_TOKENS:
+        return API_TOKENS[token]
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+class SignalBase(BaseModel):
+    content: str = Field(..., min_length=1, max_length=1000)
+    tags: List[str] = Field(default_factory=list)
+
+    @validator('tags', each_item=True)
+    def tags_must_be_nonempty(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Tags must be non-empty strings')
+        return v.strip()
+
+class SignalCreate(SignalBase):
+    pass
+
+class Signal(SignalBase):
+    signal_id: str
+    sender_id: str
+    timestamp: float
+
+app = FastAPI(title="Signal Beacon 2025 API", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+signals_db = {}
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("signal_beacon_2025")
+
+def generate_signal_id(sender_id: str, content: str, timestamp: float) -> str:
+    data = f"{sender_id}|{content}|{timestamp}"
+    return hashlib.sha256(data.encode()).hexdigest()
+
+@app.post("/signals/", response_model=Signal, summary="Broadcast a new signal")
+def broadcast_signal(
+    signal: SignalCreate,
+    request: Request,
+    token: Optional[str] = None,
+    current_user: str = Depends(get_current_user)
+):
+    timestamp = time.time()
+    signal_id = generate_signal_id(current_user, signal.content, timestamp)
+    if signal_id in signals_db:
+        raise HTTPException(status_code=409, detail="Signal already exists")
+
+    new_signal = Signal(
+        signal_id=signal_id,
+        sender_id=current_user,
+        content=signal.content,
+        tags=signal.tags,
+        timestamp=timestamp
+    )
+    signals_db[signal_id] = new_signal
+    logger.info(f"User '{current_user}' broadcasted signal: {signal_id}")
+    return new_signal
+
+@app.get("/signals/", response_model=List[Signal], summary="List signals with optional tag filtering")
+def list_signals(tag: Optional[str] = None, token: Optional[str] = None, current_user: str = Depends(get_current_user)):
+    if tag:
+        filtered = [s for s in signals_db.values() if tag in s.tags]
+        logger.info(f"User '{current_user}' queried signals with tag '{tag}', found {len(filtered)}")
+        return filtered
+    logger.info(f"User '{current_user}' queried all signals")
+    return list(signals_db.values())
+
+@app.get("/signals/{signal_id}", response_model=Signal, summary="Retrieve a specific signal by ID")
+def get_signal(signal_id: str, token: Optional[str] = None, current_user: str = Depends(get_current_user)):
+    signal = signals_db.get(signal_id)
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    logger.info(f"User '{current_user}' retrieved signal {signal_id}")
+    return signal
+
+@app.delete("/signals/{signal_id}", summary="Delete a signal (admin only)")
+def delete_signal(signal_id: str, token: Optional[str] = None, current_user: str = Depends(get_current_user)):
+    if current_user != "AdminUser":
+        raise HTTPException(status_code=403, detail="Forbidden: Admins only")
+    if signal_id in signals_db:
+        del signals_db[signal_id]
+        logger.info(f"Admin '{current_user}' deleted signal {signal_id}")
+        return {"detail": "Signal deleted"}
+    else:
+        raise HTTPException(status_code=404, detail="Signal not found")
+
+@app.get("/health", summary="Health check endpoint")
+def health_check():
+    return {"status": "Signal Beacon 2025 API is running"}
